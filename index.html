@@ -112,8 +112,10 @@
   <div id="key-form">
     <p class="muted" id="form-error"></p>
     <p class="muted">Paste the same two values you pasted into OnlyT-ws's Settings.</p>
-    <input id="url-input" type="text" placeholder="Project URL, e.g. https://xxxxx.supabase.co" autocomplete="off" />
-    <input id="key-input" type="text" placeholder="API key (the anon key)" autocomplete="off" />
+    <input id="url-input" type="text" placeholder="Project URL, e.g. https://xxxxx.supabase.co"
+      autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+    <input id="key-input" type="text" placeholder="API key (the anon key)"
+      autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
     <button id="key-save">Save</button>
   </div>
   <div id="app" style="display:none">
@@ -230,30 +232,43 @@
     location.reload();
   }
 
+  // One shared place that fetches and interprets the response, used both to
+  // test a value the moment it's typed in (so a wrong one is caught with a
+  // real reason on screen, never a silent save-then-fail loop) and by the
+  // repeating poll() below. Throws on a network-level failure (a typo'd or
+  // unreachable project URL); the caller decides what that means for it.
+  async function fetchReadings(projectUrl, key) {
+    const url = projectUrl + '/rest/v1/readings?select=*&order=created_at.desc&limit=' + ROW_LIMIT;
+    const response = await fetch(url, {
+      headers: { apikey: key, Authorization: 'Bearer ' + key },
+    });
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, reason: 'unauthorized' };
+    }
+    if (!response.ok) {
+      return { ok: false, reason: 'http', status: response.status };
+    }
+    const rows = await response.json();
+    return { ok: true, rows: Array.isArray(rows) ? rows : [] };
+  }
+
   async function poll(projectUrl, key) {
     try {
-      const url = projectUrl + '/rest/v1/readings?select=*&order=created_at.desc&limit=' + ROW_LIMIT;
-      const response = await fetch(url, {
-        headers: { apikey: key, Authorization: 'Bearer ' + key },
-      });
-      if (response.status === 401 || response.status === 403) {
-        // A wrong key (or a project URL for a different project) -- clear
-        // both so the form reappears instead of repeating the same failed
-        // request every 15 seconds with no way to fix it.
-        forgetAndShowForm();
-        return;
-      }
-      if (!response.ok) {
-        freshnessEl.textContent = 'The server said: ' + response.status + '. Check the project URL is right.';
+      const result = await fetchReadings(projectUrl, key);
+      if (!result.ok) {
+        if (result.reason === 'unauthorized') {
+          // The key that worked when it was first entered stopped working
+          // (e.g. revoked in Supabase since) -- clear it rather than repeat
+          // the same failing request every 15 seconds with no way out.
+          forgetAndShowForm();
+          return;
+        }
+        freshnessEl.textContent = 'The server said: ' + result.status + '. Check the project URL is right.';
         freshnessEl.classList.add('stale');
         return;
       }
-      const rows = await response.json();
-      render(Array.isArray(rows) ? rows : []);
+      render(result.rows);
     } catch {
-      // A wrong project URL (typo, or a non-https value) fails here, before
-      // any status code exists to check above -- same escape hatch matters
-      // just as much for this case.
       freshnessEl.textContent = 'Could not reach that project URL. Check it’s typed correctly, or ' +
         'use "Change project URL / key" below.';
       freshnessEl.classList.add('stale');
@@ -269,9 +284,11 @@
     setInterval(() => poll(savedUrl, savedKey), 15000);
     document.getElementById('key-change').addEventListener('click', forgetAndShowForm);
   } else {
-    document.getElementById('key-save').addEventListener('click', () => {
+    const saveButton = document.getElementById('key-save');
+    saveButton.addEventListener('click', async () => {
       const urlValue = urlInput.value.trim().replace(/\/+$/, '');
       const keyValue = keyInput.value.trim();
+      formError.textContent = '';
       if (!urlValue || !keyValue) {
         formError.textContent = 'Both boxes are required.';
         return;
@@ -279,6 +296,29 @@
       if (!/^https:\/\//i.test(urlValue)) {
         formError.textContent = 'The project URL must start with https://';
         return;
+      }
+      // Tested right here, before saving anything: this is the one place
+      // that turns "nothing ever shows up, no clue why" into an actual
+      // reason on screen the moment it's wrong, instead of discovering it
+      // later through the repeating poll (which has no screen to show a
+      // reason on except the stale page it already failed to leave).
+      saveButton.disabled = true;
+      saveButton.textContent = 'Checking…';
+      try {
+        const result = await fetchReadings(urlValue, keyValue);
+        if (!result.ok) {
+          formError.textContent = result.reason === 'unauthorized'
+            ? 'Supabase did not accept that key for this project URL. Copy both again from Supabase’s Settings -> API, and check for a missing character or extra space.'
+            : 'Supabase answered with an error (' + result.status + '). Double-check the project URL.';
+          return;
+        }
+      } catch {
+        formError.textContent = 'Could not reach that address at all. Check the project URL is typed ' +
+          'correctly (it should start with https://) and that this device has internet.';
+        return;
+      } finally {
+        saveButton.disabled = false;
+        saveButton.textContent = 'Save';
       }
       localStorage.setItem(URL_STORAGE_KEY, urlValue);
       localStorage.setItem(KEY_STORAGE_KEY, keyValue);
