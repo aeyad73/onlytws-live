@@ -96,30 +96,43 @@
     cursor: pointer;
   }
   .muted { color: var(--text-faint); font-size: var(--fs-1); }
+  .muted-button {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--hairline);
+    font-weight: 400;
+  }
+  #form-error:empty { display: none; }
+  #form-error:not(:empty) { color: var(--crit); }
 </style>
 </head>
 <body>
 <main>
   <h1>OnlyT-ws cloud push</h1>
   <div id="key-form">
-    <p class="muted">Paste the same API key you pasted into OnlyT-ws's Settings (your Supabase project's "anon" key).</p>
-    <input id="key-input" type="text" placeholder="API key" />
+    <p class="muted" id="form-error"></p>
+    <p class="muted">Paste the same two values you pasted into OnlyT-ws's Settings.</p>
+    <input id="url-input" type="text" placeholder="Project URL, e.g. https://xxxxx.supabase.co" autocomplete="off" />
+    <input id="key-input" type="text" placeholder="API key (the anon key)" autocomplete="off" />
     <button id="key-save">Save</button>
   </div>
   <div id="app" style="display:none">
     <p id="freshness" class="freshness"></p>
     <div id="cards"></div>
+    <button id="key-change" class="muted-button">Change project URL / key</button>
   </div>
-  <p class="muted">The key stays only in this browser. You can always find it again in your Supabase project's Settings -> API.</p>
+  <p class="muted">Both stay only in this browser. You can always find them again in your Supabase project's Settings -> API.</p>
 </main>
 <script>
-  // This page is served from Supabase Storage on the project's own domain,
-  // so its own address IS the project's base URL -- no separate field to
-  // paste or get wrong.
-  const PROJECT_URL = location.origin;
+  // This page is hosted separately from the Supabase project (GitHub Pages,
+  // not Supabase Storage -- Supabase refuses to serve .html as a real
+  // webpage on its own free domain), so its own address is NOT the
+  // project's base URL. Both the URL and the key are asked for and stored
+  // here, in this browser only.
   const ROW_LIMIT = 60; // ~1 hour at the fixed 60-second push interval.
   const STALE_AFTER_MS = 5 * 60 * 1000; // ~5 missed pushes in a row.
-  const STORAGE_KEY = 'onlytws-api-key';
+  const URL_STORAGE_KEY = 'onlytws-project-url';
+  const KEY_STORAGE_KEY = 'onlytws-api-key';
 
   // Rough visual cues only, independent of the alert thresholds you can set
   // in OnlyT-ws's own Settings -- just enough to make a high reading stand
@@ -133,7 +146,9 @@
   ];
 
   const form = document.getElementById('key-form');
-  const input = document.getElementById('key-input');
+  const urlInput = document.getElementById('url-input');
+  const keyInput = document.getElementById('key-input');
+  const formError = document.getElementById('form-error');
   const app = document.getElementById('app');
   const freshnessEl = document.getElementById('freshness');
   const cardsEl = document.getElementById('cards');
@@ -209,36 +224,64 @@
     }).join('');
   }
 
-  async function poll(key) {
+  function forgetAndShowForm() {
+    localStorage.removeItem(URL_STORAGE_KEY);
+    localStorage.removeItem(KEY_STORAGE_KEY);
+    location.reload();
+  }
+
+  async function poll(projectUrl, key) {
     try {
-      const url = PROJECT_URL + '/rest/v1/readings?select=*&order=created_at.desc&limit=' + ROW_LIMIT;
+      const url = projectUrl + '/rest/v1/readings?select=*&order=created_at.desc&limit=' + ROW_LIMIT;
       const response = await fetch(url, {
         headers: { apikey: key, Authorization: 'Bearer ' + key },
       });
       if (response.status === 401 || response.status === 403) {
-        localStorage.removeItem(STORAGE_KEY);
-        location.reload();
+        // A wrong key (or a project URL for a different project) -- clear
+        // both so the form reappears instead of repeating the same failed
+        // request every 15 seconds with no way to fix it.
+        forgetAndShowForm();
+        return;
+      }
+      if (!response.ok) {
+        freshnessEl.textContent = 'The server said: ' + response.status + '. Check the project URL is right.';
+        freshnessEl.classList.add('stale');
         return;
       }
       const rows = await response.json();
       render(Array.isArray(rows) ? rows : []);
     } catch {
-      freshnessEl.textContent = 'Could not reach the server.';
+      // A wrong project URL (typo, or a non-https value) fails here, before
+      // any status code exists to check above -- same escape hatch matters
+      // just as much for this case.
+      freshnessEl.textContent = 'Could not reach that project URL. Check it’s typed correctly, or ' +
+        'use "Change project URL / key" below.';
       freshnessEl.classList.add('stale');
     }
   }
 
-  const saved = localStorage.getItem(STORAGE_KEY);
-  if (saved) {
+  const savedUrl = localStorage.getItem(URL_STORAGE_KEY);
+  const savedKey = localStorage.getItem(KEY_STORAGE_KEY);
+  if (savedUrl && savedKey) {
     form.style.display = 'none';
     app.style.display = 'block';
-    poll(saved);
-    setInterval(() => poll(saved), 15000);
+    poll(savedUrl, savedKey);
+    setInterval(() => poll(savedUrl, savedKey), 15000);
+    document.getElementById('key-change').addEventListener('click', forgetAndShowForm);
   } else {
     document.getElementById('key-save').addEventListener('click', () => {
-      const value = input.value.trim();
-      if (!value) return;
-      localStorage.setItem(STORAGE_KEY, value);
+      const urlValue = urlInput.value.trim().replace(/\/+$/, '');
+      const keyValue = keyInput.value.trim();
+      if (!urlValue || !keyValue) {
+        formError.textContent = 'Both boxes are required.';
+        return;
+      }
+      if (!/^https:\/\//i.test(urlValue)) {
+        formError.textContent = 'The project URL must start with https://';
+        return;
+      }
+      localStorage.setItem(URL_STORAGE_KEY, urlValue);
+      localStorage.setItem(KEY_STORAGE_KEY, keyValue);
       location.reload();
     });
   }
