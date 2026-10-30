@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OnlyT-ws cloud push</title>
+<style>
+  /* Colours copied from dashboard/src/styles/tokens.css's dark theme, so this
+     page matches the desktop app's own look instead of inventing a new one.
+     System fonts only (no bundled/CDN fonts) -- keeps this a single
+     dependency-free file you can upload as-is. */
+  :root {
+    --bg-deep: #14181c;
+    --bg-panel: #1a1f24;
+    --bg-panel-raised: #222830;
+    --hairline: #29313a;
+    --text-primary: #e4eaee;
+    --text-muted: #aab5bf;
+    --text-faint: #96a5b0;
+    --cpu: #d4a373;
+    --ram: #a9a0d0;
+    --gpu: #78b6bf;
+    --ok: #86b99a;
+    --warn: #d4a373;
+    --crit: #cf7f70;
+    --font-display: "Segoe UI Semibold", system-ui, sans-serif;
+    --font-body: system-ui, "Segoe UI", sans-serif;
+    --font-mono: ui-monospace, Consolas, monospace;
+    /* Four steps, each roughly 1.25x the one before it -- enough contrast
+       to read as a hierarchy at a glance instead of a wall of same-ish
+       text. --fs-1 is meta text (labels, captions), --fs-2 is everything
+       you read normally (body, inputs), --fs-3 is the page title, --fs-4
+       is the one hero number each card exists to show. */
+    --fs-1: 0.8rem;
+    --fs-2: 1rem;
+    --fs-3: 1.25rem;
+    --fs-4: 1.6rem;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 20px 16px 40px;
+    background: var(--bg-deep);
+    color: var(--text-primary);
+    font-family: var(--font-body);
+    font-size: var(--fs-2);
+  }
+  main { max-width: 480px; margin: 0 auto; }
+  h1 {
+    font-family: var(--font-display);
+    font-size: var(--fs-3);
+    font-weight: 600;
+    margin: 0 0 4px;
+  }
+  .freshness { color: var(--text-faint); font-size: var(--fs-1); margin: 0 0 16px; }
+  .freshness.stale { color: var(--crit); }
+  .card {
+    background: var(--bg-panel);
+    border: 1px solid var(--hairline);
+    border-radius: 14px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+  .card-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .card-label { color: var(--text-muted); font-size: var(--fs-1); }
+  .card-value { font-family: var(--font-mono); font-size: var(--fs-4); }
+  .card-value.ok { color: var(--ok); }
+  .card-value.warn { color: var(--warn); }
+  .card-value.crit { color: var(--crit); }
+  .card-value.unavailable { color: var(--text-faint); font-size: var(--fs-2); }
+  svg.sparkline { display: block; width: 100%; height: 36px; }
+  input {
+    width: 100%;
+    padding: 9px 10px;
+    margin-top: 8px;
+    background: var(--bg-panel-raised);
+    color: var(--text-primary);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    font-family: var(--font-body);
+    font-size: var(--fs-2);
+  }
+  button {
+    margin-top: 10px;
+    padding: 9px 16px;
+    border-radius: 8px;
+    border: none;
+    background: var(--gpu);
+    color: #10151a;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .muted { color: var(--text-faint); font-size: var(--fs-1); }
+</style>
+</head>
+<body>
+<main>
+  <h1>OnlyT-ws cloud push</h1>
+  <div id="key-form">
+    <p class="muted">Paste the same API key you pasted into OnlyT-ws's Settings (your Supabase project's "anon" key).</p>
+    <input id="key-input" type="text" placeholder="API key" />
+    <button id="key-save">Save</button>
+  </div>
+  <div id="app" style="display:none">
+    <p id="freshness" class="freshness"></p>
+    <div id="cards"></div>
+  </div>
+  <p class="muted">The key stays only in this browser. You can always find it again in your Supabase project's Settings -> API.</p>
+</main>
+<script>
+  // This page is served from Supabase Storage on the project's own domain,
+  // so its own address IS the project's base URL -- no separate field to
+  // paste or get wrong.
+  const PROJECT_URL = location.origin;
+  const ROW_LIMIT = 60; // ~1 hour at the fixed 60-second push interval.
+  const STALE_AFTER_MS = 5 * 60 * 1000; // ~5 missed pushes in a row.
+  const STORAGE_KEY = 'onlytws-api-key';
+
+  // Rough visual cues only, independent of the alert thresholds you can set
+  // in OnlyT-ws's own Settings -- just enough to make a high reading stand
+  // out at a glance.
+  const METRICS = [
+    { field: 'cpu_percent', label: 'CPU', unit: '%', accent: 'var(--cpu)', warn: 75, crit: 90 },
+    { field: 'gpu_percent', label: 'GPU', unit: '%', accent: 'var(--gpu)', warn: 75, crit: 90 },
+    { field: 'memory_percent', label: 'Memory', unit: '%', accent: 'var(--ram)', warn: 80, crit: 92 },
+    { field: 'cpu_temperature_c', label: 'CPU temperature', unit: '°C', accent: 'var(--cpu)', warn: 75, crit: 85 },
+    { field: 'gpu_temperature_c', label: 'GPU temperature', unit: '°C', accent: 'var(--gpu)', warn: 80, crit: 85 },
+  ];
+
+  const form = document.getElementById('key-form');
+  const input = document.getElementById('key-input');
+  const app = document.getElementById('app');
+  const freshnessEl = document.getElementById('freshness');
+  const cardsEl = document.getElementById('cards');
+
+  function severity(metric, value) {
+    if (value === null || value === undefined) return 'unavailable';
+    if (value >= metric.crit) return 'crit';
+    if (value >= metric.warn) return 'warn';
+    return 'ok';
+  }
+
+  function sparklinePath(values) {
+    const known = values.filter((v) => v !== null && v !== undefined);
+    if (known.length < 2) return null;
+    const min = Math.min(...known);
+    const max = Math.max(...known);
+    const span = max - min || 1; // flat line if every reading was identical
+    const width = 280;
+    const height = 32;
+    const step = width / (values.length - 1);
+    let path = '';
+    let drawing = false;
+    values.forEach((v, i) => {
+      const x = i * step;
+      if (v === null || v === undefined) { drawing = false; return; }
+      const y = height - ((v - min) / span) * height;
+      path += (drawing ? ' L ' : 'M ') + x.toFixed(1) + ' ' + y.toFixed(1);
+      drawing = true;
+    });
+    return path;
+  }
+
+  function freshnessText(latestIso) {
+    if (!latestIso) return { text: 'Nothing received yet.', stale: false };
+    const ageMs = Date.now() - new Date(latestIso).getTime();
+    const stale = ageMs > STALE_AFTER_MS;
+    const seconds = Math.round(ageMs / 1000);
+    let when;
+    if (seconds < 5) when = 'just now';
+    else if (seconds < 60) when = seconds + 's ago';
+    else when = Math.round(seconds / 60) + 'm ago';
+    return { text: 'Last seen: ' + when + (stale ? ' (stale -- check your PC)' : ''), stale };
+  }
+
+  function render(rows) {
+    // rows: newest first (how the query asks for them). Charts read left to
+    // right in time order, so reverse once here rather than re-deriving it
+    // per metric below.
+    const chronological = rows.slice().reverse();
+    const latest = rows[0];
+
+    const fresh = freshnessText(latest ? latest.created_at : null);
+    freshnessEl.textContent = fresh.text;
+    freshnessEl.classList.toggle('stale', fresh.stale);
+
+    cardsEl.innerHTML = METRICS.map((metric) => {
+      const value = latest ? latest[metric.field] : null;
+      const level = severity(metric, value);
+      const valueText = value === null || value === undefined
+        ? 'not available'
+        : value.toFixed(metric.unit === '%' ? 0 : 1) + metric.unit;
+      const path = sparklinePath(chronological.map((r) => r[metric.field]));
+      const svg = path
+        ? '<svg class="sparkline" viewBox="0 0 280 32" preserveAspectRatio="none">'
+          + '<path d="' + path + '" fill="none" stroke="' + metric.accent + '" stroke-width="2" />'
+          + '</svg>'
+        : '<p class="muted">Not enough history yet.</p>';
+      return '<div class="card">'
+        + '<div class="card-top"><span class="card-label">' + metric.label + '</span>'
+        + '<span class="card-value ' + level + '">' + valueText + '</span></div>'
+        + svg
+        + '</div>';
+    }).join('');
+  }
+
+  async function poll(key) {
+    try {
+      const url = PROJECT_URL + '/rest/v1/readings?select=*&order=created_at.desc&limit=' + ROW_LIMIT;
+      const response = await fetch(url, {
+        headers: { apikey: key, Authorization: 'Bearer ' + key },
+      });
+      if (response.status === 401 || response.status === 403) {
+        localStorage.removeItem(STORAGE_KEY);
+        location.reload();
+        return;
+      }
+      const rows = await response.json();
+      render(Array.isArray(rows) ? rows : []);
+    } catch {
+      freshnessEl.textContent = 'Could not reach the server.';
+      freshnessEl.classList.add('stale');
+    }
+  }
+
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (saved) {
+    form.style.display = 'none';
+    app.style.display = 'block';
+    poll(saved);
+    setInterval(() => poll(saved), 15000);
+  } else {
+    document.getElementById('key-save').addEventListener('click', () => {
+      const value = input.value.trim();
+      if (!value) return;
+      localStorage.setItem(STORAGE_KEY, value);
+      location.reload();
+    });
+  }
+</script>
+</body>
+</html>
